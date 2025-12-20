@@ -39,8 +39,8 @@ WORKDIR /app
 COPY --from=builder /app/target/release/iptv /usr/local/bin/iptv
 
 # Add an entrypoint to translate environment variables into CLI flags
-COPY entrypoint.sh /usr/local/bin/entrypoint
-RUN chmod +x /usr/local/bin/entrypoint
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
 USER iptv
 
@@ -48,5 +48,5 @@ EXPOSE 7878
 
 ENV RUST_LOG=info
 
-ENTRYPOINT ["/usr/local/bin/entrypoint"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["--help"]

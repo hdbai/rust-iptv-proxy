@@ -24,7 +24,7 @@ Options:
 
 ### Docker environment variables
 
-When running the Docker image, you can pass configuration through environment variables instead of CLI flags. Only set the values you need:
+When running the Docker image, you can pass configuration through environment variables instead of CLI flags. The runtime entrypoint turns the variables into the corresponding CLI flags before starting the binary (for example, `IPTV_USER=foo IPTV_MAC=aa:bb:cc` becomes `iptv -u foo -m aa:bb:cc`). Only set the values you need:
 
 - `IPTV_USER` / `IPTV_PASSWD` / `IPTV_MAC`: credentials for the upstream service (required by the binary)
 - `IPTV_IMEI`: optional IMEI value

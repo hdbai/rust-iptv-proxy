@@ -39,8 +39,11 @@ WORKDIR /app
 COPY --from=builder /app/target/release/iptv /usr/local/bin/iptv
 
 # Add an entrypoint to translate environment variables into CLI flags
+# Normalize line endings in case the source checkout uses CRLF and ensure
+# the script remains executable in the runtime image.
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh \
+    && chmod +x /usr/local/bin/entrypoint.sh
 
 USER iptv
 

@@ -22,6 +22,29 @@ Options:
 - `/playlist`: m3u8 list
 - `/xmltv`: EGP
 
+### Docker environment variables
+
+When running the Docker image, you can pass configuration through environment variables instead of CLI flags. Only set the values you need:
+
+- `IPTV_USER` / `IPTV_PASSWD` / `IPTV_MAC`: credentials for the upstream service (required by the binary)
+- `IPTV_IMEI`: optional IMEI value
+- `IPTV_BIND`: bind address, e.g. `0.0.0.0:7878`
+- `IPTV_ADDRESS`: source IP/interface name for requests
+- `IPTV_INTERFACE`: interface for the proxy to use
+- `IPTV_EXTRA_PLAYLIST` / `IPTV_EXTRA_XMLTV`: URLs for additional playlists or XMLTV data
+- `IPTV_ENABLE_UDP_PROXY` and `IPTV_ENABLE_RTSP_PROXY`: set to `true`/`1` to enable the corresponding proxy
+
+Example:
+
+```sh
+docker run --rm -p 7878:7878 \
+  -e IPTV_USER=myuser \
+  -e IPTV_PASSWD=mypassword \
+  -e IPTV_MAC=00:11:22:33:44:55 \
+  -e IPTV_BIND=0.0.0.0:7878 \
+  ghcr.io/your-org/iptv:latest
+```
+
 ### Example init.d
 
 ```sh

@@ -50,6 +50,6 @@ USER iptv
 EXPOSE 7878
 
 ENV RUST_LOG=info
+ENV IPTV_BIND=0.0.0.0:7878
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["--help"]

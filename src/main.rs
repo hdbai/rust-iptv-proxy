@@ -224,8 +224,9 @@ async fn playlist(args: Data<Args>, req: HttpRequest) -> impl Responder {
                         } else {
                             "普通频道"
                         };
-                        let catch_up = format!(r#" catchup="append" catchup-source="{}?playseek=${{(b)yyyyMMddHHmmss}}-${{(e)yyyyMMddHHmmss}}" "#,
-                            c.igmp.as_ref().map(|_| &c.rtsp).unwrap_or(&"".to_string()));
+                        let catch_up = String::from(
+                            r#" catchup="append" catchup-source="?playseek=${(b)yyyyMMddHHmmss}-${(e)yyyyMMddHHmmss}" "#,
+                        );
                         format!(
                             r#"#EXTINF:-1 tvg-id="{0}" tvg-name="{1}" tvg-chno="{0}"{3}tvg-logo="{4}://{5}/logo/{6}.png" group-title="{2}",{1}"#,
                             c.id, c.name, group, catch_up, scheme, host, c.id

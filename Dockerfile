@@ -1,58 +1,55 @@
 ################
-##### Builder
-FROM rust:1.76-alpine as builder
+# Builder
+FROM rust:1.76-alpine AS builder
 
-# 安装必要的构建工具
+ARG TARGET=x86_64-unknown-linux-musl
+
+# Install build dependencies
 RUN apk add --no-cache musl-dev
 
-# 设置工作目录
+# Set working directory
 WORKDIR /app
 
-# 复制项目依赖描述文件
+# Copy dependency manifests
 COPY Cargo.lock Cargo.toml ./
 
-# 创建一个假的 main.rs 以缓存依赖
-RUN mkdir -p src && echo "fn main() {}" > src/main.rs
+# Create a dummy main.rs to cache dependencies
+RUN mkdir -p src \
+    && echo "fn main() {}" > src/main.rs \
+    && cargo build --release --locked --target ${TARGET} \
+    && rm -rf src target/${TARGET}/release/deps/iptv*
 
-# 构建依赖
-RUN cargo build --release --target x86_64-unknown-linux-musl
-
-# 删除临时的 main.rs 和构建缓存
-RUN rm -rf src && rm -rf target/x86_64-unknown-linux-musl/release/deps/iptv*
-
-# 复制实际源代码
+# Copy actual sources
 COPY src ./src
 
-# 构建应用
-RUN cargo build --release --target x86_64-unknown-linux-musl
+# Build application
+RUN cargo build --release --locked --target ${TARGET}
 
 ################
-##### Runtime
+# Runtime
 FROM alpine:3.19 AS runtime
 
-# 安装运行时依赖
-RUN apk add --no-cache ca-certificates tzdata
+ARG TARGET=x86_64-unknown-linux-musl
 
-# 创建非特权用户
-RUN addgroup -g 1000 appuser && \
-    adduser -u 1000 -G appuser -s /bin/sh -D appuser
+# Install runtime dependencies and create a non-root user
+RUN apk add --no-cache ca-certificates tzdata \
+    && addgroup -g 1000 appuser \
+    && adduser -u 1000 -G appuser -s /bin/sh -D appuser
 
-# 复制二进制文件
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/iptv /usr/local/bin/iptv
+# Copy binary and entrypoint
+COPY --from=builder /app/target/${TARGET}/release/iptv /usr/local/bin/iptv
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# 设置权限
-RUN chmod +x /usr/local/bin/iptv && \
-    chown appuser:appuser /usr/local/bin/iptv
+USER appuser
 
-# 暴露端口
 EXPOSE 7878
 
-# 设置环境变量
-ENV IPTV_USER=""
-ENV IPTV_PASSWD=""
-ENV IPTV_MAC=""
-ENV IPTV_IMEI=""
-ENV RUST_LOG=info
-ENV IPTV_BIND=0.0.0.0:7878
+ENV IPTV_USER="" \
+    IPTV_PASSWD="" \
+    IPTV_MAC="" \
+    IPTV_IMEI="" \
+    IPTV_BIND=0.0.0.0:7878 \
+    RUST_LOG=info
 
-CMD /usr/local/bin/iptv -u "${IPTV_USER}" -p "${IPTV_PASSWD}" -m "${IPTV_MAC}" -i "${IPTV_IMEI}"
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

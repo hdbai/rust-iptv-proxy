@@ -13,14 +13,77 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::{
     collections::HashMap,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::task::JoinSet;
+use tokio::sync::RwLock;
 
-fn get_client_with_if(#[allow(unused_variables)] if_name: Option<&str>) -> Result<Client> {
-    let timeout = Duration::new(5, 0);
+use futures_util::stream::{self, StreamExt};
+
+const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+const BASE_URL_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const CHANNELS_TTL: Duration = Duration::from_secs(10 * 60);
+const EPG_TTL: Duration = Duration::from_secs(30 * 60);
+const EPG_CONCURRENCY: usize = 12;
+const DAY_MS: u128 = 86_400_000;
+
+struct Cached<T> {
+    value: T,
+    expires_at: Instant,
+}
+
+impl<T> Cached<T> {
+    fn new(value: T, ttl: Duration) -> Self {
+        Self {
+            value,
+            expires_at: Instant::now() + ttl,
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        Instant::now() < self.expires_at
+    }
+}
+
+struct ChannelCache {
+    scheme: String,
+    host: String,
+    channels: Vec<Channel>,
+}
+
+impl ChannelCache {
+    fn matches(&self, scheme: &str, host: &str) -> bool {
+        self.scheme == scheme && self.host == host
+    }
+}
+
+pub(crate) struct IptvState {
+    client: Client,
+    base_url: RwLock<Option<Cached<String>>>,
+    channels: RwLock<Option<Cached<ChannelCache>>>,
+    epg: RwLock<Option<Cached<ChannelCache>>>,
+}
+
+impl IptvState {
+    pub(crate) fn new(args: &Args) -> Result<Self> {
+        let client = build_client(args.interface.as_deref())?;
+        Ok(Self {
+            client,
+            base_url: RwLock::new(None),
+            channels: RwLock::new(None),
+            epg: RwLock::new(None),
+        })
+    }
+
+    pub(crate) fn client(&self) -> &Client {
+        &self.client
+    }
+}
+
+fn build_client(#[allow(unused_variables)] if_name: Option<&str>) -> Result<Client> {
     #[allow(unused_mut)]
-    let mut client = Client::builder().timeout(timeout).cookie_store(true);
+    let mut client = Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .cookie_store(true);
 
     #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
     if let Some(i) = if_name {
@@ -42,7 +105,13 @@ fn get_client_with_if(#[allow(unused_variables)] if_name: Option<&str>) -> Resul
     Ok(client.build()?)
 }
 
-async fn get_base_url(client: &Client, args: &Args) -> Result<String> {
+async fn get_base_url(state: &IptvState, args: &Args) -> Result<String> {
+    if let Some(cached) = state.base_url.read().await.as_ref() {
+        if cached.is_valid() {
+            return Ok(cached.value.clone());
+        }
+    }
+
     let user = args.user.as_str();
 
     let params = [("Action", "Login"), ("return_type", "1"), ("UserID", user)];
@@ -52,7 +121,7 @@ async fn get_base_url(client: &Client, args: &Args) -> Result<String> {
         params,
     )?;
 
-    let response = client.get(url).send().await?.error_for_status()?;
+    let response = state.client.get(url).send().await?.error_for_status()?;
 
     let epgurl = reqwest::Url::parse(response.json::<AuthJson>().await?.epgurl.as_str())?;
     let base_url = format!(
@@ -62,9 +131,13 @@ async fn get_base_url(client: &Client, args: &Args) -> Result<String> {
         epgurl.port_or_known_default().ok_or(anyhow!("no host"))?,
     );
     debug!("Got base_url {base_url}");
+
+    *state.base_url.write().await = Some(Cached::new(base_url.clone(), BASE_URL_TTL));
+
     Ok(base_url)
 }
 
+#[derive(Clone)]
 pub(crate) struct Program {
     pub(crate) start: i64,
     pub(crate) stop: i64,
@@ -72,6 +145,7 @@ pub(crate) struct Program {
     pub(crate) desc: String,
 }
 
+#[derive(Clone)]
 pub(crate) struct Channel {
     pub(crate) id: u64,
     pub(crate) name: String,
@@ -107,22 +181,88 @@ struct Bill {
 }
 
 pub(crate) async fn get_channels(
+    state: &IptvState,
     args: &Args,
     need_epg: bool,
     scheme: &str,
     host: &str,
 ) -> Result<Vec<Channel>> {
+    if need_epg {
+        if let Some(cached) = state.epg.read().await.as_ref() {
+            if cached.is_valid() && cached.value.matches(scheme, host) {
+                return Ok(cached.value.channels.clone());
+            }
+        }
+    } else if let Some(cached) = state.channels.read().await.as_ref() {
+        if cached.is_valid() && cached.value.matches(scheme, host) {
+            return Ok(cached.value.channels.clone());
+        }
+    }
+
     info!("Obtaining channels");
 
+    let base_url = get_base_url(state, args).await?;
+
+    let mut channels = {
+        let cached = state
+            .channels
+            .read()
+            .await
+            .as_ref()
+            .filter(|cache| cache.is_valid() && cache.value.matches(scheme, host))
+            .map(|cache| cache.value.channels.clone());
+
+        if let Some(channels) = cached {
+            channels
+        } else {
+            let channels = fetch_channels(state, args, &base_url, scheme, host).await?;
+            *state.channels.write().await = Some(Cached::new(
+                ChannelCache {
+                    scheme: scheme.to_string(),
+                    host: host.to_string(),
+                    channels: channels.clone(),
+                },
+                CHANNELS_TTL,
+            ));
+            channels
+        }
+    };
+
+    if !need_epg {
+        return Ok(channels);
+    }
+
+    if let Some(cached) = state.epg.read().await.as_ref() {
+        if cached.is_valid() && cached.value.matches(scheme, host) {
+            return Ok(cached.value.channels.clone());
+        }
+    }
+
+    channels = fetch_epg(&state.client, &base_url, channels).await?;
+    *state.epg.write().await = Some(Cached::new(
+        ChannelCache {
+            scheme: scheme.to_string(),
+            host: host.to_string(),
+            channels: channels.clone(),
+        },
+        EPG_TTL,
+    ));
+
+    Ok(channels)
+}
+
+async fn fetch_channels(
+    state: &IptvState,
+    args: &Args,
+    base_url: &str,
+    scheme: &str,
+    host: &str,
+) -> Result<Vec<Channel>> {
     let user = args.user.as_str();
     let passwd = args.passwd.as_str();
     let mac = args.mac.as_str();
     let imei = args.imei.as_str();
     let ip = args.address.as_str();
-
-    let client = get_client_with_if(args.interface.as_deref())?;
-
-    let base_url = get_base_url(&client, args).await?;
 
     let params = [
         ("response_type", "EncryToken"),
@@ -133,7 +273,7 @@ pub(crate) async fn get_channels(
         format!("{base_url}/EPG/oauth/v2/authorize").as_str(),
         params,
     )?;
-    let response = client.get(url).send().await?.error_for_status()?;
+    let response = state.client.get(url).send().await?.error_for_status()?;
 
     let token = response.json::<TokenJson>().await?.encry_token;
 
@@ -170,11 +310,11 @@ pub(crate) async fn get_channels(
     ];
     let url =
         reqwest::Url::parse_with_params(format!("{base_url}/EPG/oauth/v2/token").as_str(), params)?;
-    let _response = client.get(url).send().await?.error_for_status()?;
+    let _response = state.client.get(url).send().await?.error_for_status()?;
 
     let url = reqwest::Url::parse(format!("{base_url}/EPG/jsp/getchannellistHWCTC.jsp").as_str())?;
 
-    let response = client.get(url).send().await?.error_for_status()?;
+    let response = state.client.get(url).send().await?.error_for_status()?;
 
     let res = response.text().await?;
     let re = Regex::new("Authentication.CTCSetConfig\\('Channel','(.+?)'\\)")?;
@@ -238,55 +378,73 @@ pub(crate) async fn get_channels(
 
     info!("Got {} channel(s)", channels.len());
 
-    if !need_epg {
-        return Ok(channels);
-    }
-
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
-
-    let mut tasks = JoinSet::new();
-
-    for channel in channels.into_iter() {
-        let params = [
-            ("channelId", format!("{}", channel.id)),
-            ("begin", format!("{}", now - 86400000 * 2)),
-            ("end", format!("{}", now + 86400000 * 5)),
-        ];
-        let url = reqwest::Url::parse_with_params(
-            format!("{base_url}/EPG/jsp/iptvsnmv3/en/play/ajax/_ajax_getPlaybillList.jsp").as_str(),
-            params,
-        )?;
-        let client = client.clone();
-        tasks.spawn(async move { (client.get(url).send().await, channel) });
-    }
-    let mut channels = vec![];
-    while let Some(Ok((Ok(res), mut channel))) = tasks.join_next().await {
-        if let Ok(play_bill_list) = res.json::<PlaybillList>().await {
-            for bill in play_bill_list.list.into_iter() {
-                channel.epg.push(Program {
-                    start: bill.start_time,
-                    stop: bill.end_time,
-                    title: bill.name.clone(),
-                    desc: bill.name,
-                })
-            }
-        }
-        channels.push(channel);
-    }
-
     Ok(channels)
 }
 
-pub(crate) async fn get_icon(args: &Args, id: &str) -> Result<Vec<u8>> {
-    let client = get_client_with_if(args.interface.as_deref())?;
+async fn fetch_epg(client: &Client, base_url: &str, channels: Vec<Channel>) -> Result<Vec<Channel>> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+    let base_url = base_url.to_string();
 
-    let base_url = get_base_url(&client, args).await?;
+    let mut tasks = stream::iter(channels.into_iter().map(|mut channel| {
+        let client = client.clone();
+        let base_url = base_url.clone();
+        async move {
+            let params = [
+                ("channelId", format!("{}", channel.id)),
+                ("begin", format!("{}", now - DAY_MS * 2)),
+                ("end", format!("{}", now + DAY_MS * 5)),
+            ];
+            let url = match reqwest::Url::parse_with_params(
+                format!("{base_url}/EPG/jsp/iptvsnmv3/en/play/ajax/_ajax_getPlaybillList.jsp")
+                    .as_str(),
+                params,
+            ) {
+                Ok(url) => url,
+                Err(e) => {
+                    debug!("EPG url error: {}", e);
+                    return channel;
+                }
+            };
+
+            match client.get(url).send().await.and_then(|res| res.error_for_status()) {
+                Ok(res) => {
+                    if let Ok(play_bill_list) = res.json::<PlaybillList>().await {
+                        for bill in play_bill_list.list.into_iter() {
+                            channel.epg.push(Program {
+                                start: bill.start_time,
+                                stop: bill.end_time,
+                                title: bill.name.clone(),
+                                desc: bill.name,
+                            })
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!("EPG request error: {}", e);
+                }
+            }
+
+            channel
+        }
+    }))
+    .buffer_unordered(EPG_CONCURRENCY);
+
+    let mut out = Vec::new();
+    while let Some(channel) = tasks.next().await {
+        out.push(channel);
+    }
+
+    Ok(out)
+}
+
+pub(crate) async fn get_icon(state: &IptvState, args: &Args, id: &str) -> Result<Vec<u8>> {
+    let base_url = get_base_url(state, args).await?;
 
     let url = reqwest::Url::parse(&format!(
         "{base_url}/EPG/jsp/iptvsnmv3/en/list/images/channelIcon/{}.png",
         id
     ))?;
 
-    let response = client.get(url).send().await?.error_for_status()?;
+    let response = state.client.get(url).send().await?.error_for_status()?;
     Ok(response.bytes().await?.to_vec())
 }

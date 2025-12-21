@@ -14,8 +14,8 @@ use std::{
     net::SocketAddrV4,
     process::exit,
     str::FromStr,
-    sync::Mutex,
 };
+use tokio::sync::RwLock;
 use xml::{
     reader::XmlEvent as XmlReadEvent,
     writer::{EmitterConfig, XmlEvent as XmlWriteEvent},
@@ -26,12 +26,28 @@ mod args;
 use args::Args;
 
 mod iptv;
-use iptv::{get_channels, get_icon, Channel};
+use iptv::{get_channels, get_icon, Channel, IptvState};
 
 mod proxy;
 
-static OLD_PLAYLIST: Mutex<Option<String>> = Mutex::new(None);
-static OLD_XMLTV: Mutex<Option<String>> = Mutex::new(None);
+struct AppState {
+    args: Args,
+    iptv: IptvState,
+    old_playlist: RwLock<Option<String>>,
+    old_xmltv: RwLock<Option<String>>,
+}
+
+impl AppState {
+    fn new(args: Args) -> Result<Self> {
+        let iptv = IptvState::new(&args)?;
+        Ok(Self {
+            args,
+            iptv,
+            old_playlist: RwLock::new(None),
+            old_xmltv: RwLock::new(None),
+        })
+    }
+}
 
 fn to_xmltv_time(unix_time: i64) -> Result<String> {
     match Utc.timestamp_millis_opt(unix_time) {
@@ -144,8 +160,7 @@ fn to_xmltv<R: Read>(channels: Vec<Channel>, extra: Option<EventReader<R>>) -> R
     Ok(String::from_utf8(buf.into_inner()?)?)
 }
 
-async fn parse_extra_xml(url: &str) -> Result<EventReader<Cursor<String>>> {
-    let client = Client::builder().build()?;
+async fn parse_extra_xml(client: &Client, url: &str) -> Result<EventReader<Cursor<String>>> {
     let url = reqwest::Url::parse(url)?;
     let response = client.get(url).send().await?.error_for_status()?;
     let xml = response.text().await?;
@@ -154,31 +169,35 @@ async fn parse_extra_xml(url: &str) -> Result<EventReader<Cursor<String>>> {
 }
 
 #[get("/xmltv")]
-async fn xmltv(args: Data<Args>, req: HttpRequest) -> impl Responder {
+async fn xmltv(state: Data<AppState>, req: HttpRequest) -> impl Responder {
     debug!("Get EPG");
     let scheme = req.connection_info().scheme().to_owned();
     let host = req.connection_info().host().to_owned();
+    let args = &state.args;
     let extra_xml = match &args.extra_xmltv {
-        Some(u) => parse_extra_xml(u).await.ok(),
+        Some(u) => parse_extra_xml(state.iptv.client(), u).await.ok(),
         None => None,
     };
-    let xml = get_channels(&args, true, &scheme, &host)
+    let xml = get_channels(&state.iptv, args, true, &scheme, &host)
         .await
         .and_then(|ch| to_xmltv(ch, extra_xml));
     match xml {
         Err(e) => {
-            if let Some(old_xmltv) = OLD_XMLTV.try_lock().ok().and_then(|f| f.to_owned()) {
+            let old_xmltv = state.old_xmltv.read().await.clone();
+            if let Some(old_xmltv) = old_xmltv {
                 HttpResponse::Ok().content_type("text/xml").body(old_xmltv)
             } else {
                 HttpResponse::InternalServerError().body(format!("Error getting channels: {}", e))
             }
         }
-        Ok(xml) => HttpResponse::Ok().content_type("text/xml").body(xml),
+        Ok(xml) => {
+            *state.old_xmltv.write().await = Some(xml.clone());
+            HttpResponse::Ok().content_type("text/xml").body(xml)
+        }
     }
 }
 
-async fn parse_extra_playlist(url: &str) -> Result<String> {
-    let client = Client::builder().build()?;
+async fn parse_extra_playlist(client: &Client, url: &str) -> Result<String> {
     let url = reqwest::Url::parse(url)?;
     let response = client.get(url).send().await?.error_for_status()?;
     Ok(response
@@ -189,22 +208,25 @@ async fn parse_extra_playlist(url: &str) -> Result<String> {
 }
 
 #[get("/logo/{id}.png")]
-async fn logo(args: Data<Args>, path: Path<String>) -> impl Responder {
+async fn logo(state: Data<AppState>, path: Path<String>) -> impl Responder {
     debug!("Get logo");
-    match get_icon(&args, &path).await {
+    let args = &state.args;
+    match get_icon(&state.iptv, args, &path).await {
         Ok(icon) => HttpResponse::Ok().content_type("image/png").body(icon),
         Err(e) => HttpResponse::NotFound().body(format!("Error getting channels: {}", e)),
     }
 }
 
 #[get("/playlist")]
-async fn playlist(args: Data<Args>, req: HttpRequest) -> impl Responder {
+async fn playlist(state: Data<AppState>, req: HttpRequest) -> impl Responder {
     debug!("Get playlist");
     let scheme = req.connection_info().scheme().to_owned();
     let host = req.connection_info().host().to_owned();
-    match get_channels(&args, false, &scheme, &host).await {
+    let args = &state.args;
+    match get_channels(&state.iptv, args, false, &scheme, &host).await {
         Err(e) => {
-            if let Some(old_playlist) = OLD_PLAYLIST.try_lock().ok().and_then(|f| f.to_owned()) {
+            let old_playlist = state.old_playlist.read().await.clone();
+            if let Some(old_playlist) = old_playlist {
                 HttpResponse::Ok()
                     .content_type("application/vnd.apple.mpegurl")
                     .body(old_playlist)
@@ -235,12 +257,12 @@ async fn playlist(args: Data<Args>, req: HttpRequest) -> impl Responder {
                     .collect::<Vec<_>>()
                     .join("\n")
                 + &match &args.extra_playlist {
-                    Some(u) => parse_extra_playlist(u).await.unwrap_or(String::from("")),
+                    Some(u) => parse_extra_playlist(state.iptv.client(), u)
+                        .await
+                        .unwrap_or(String::from("")),
                     None => String::from(""),
                 };
-            if let Ok(mut old_playlist) = OLD_PLAYLIST.try_lock() {
-                *old_playlist = Some(playlist.clone());
-            }
+            *state.old_playlist.write().await = Some(playlist.clone());
             HttpResponse::Ok()
                 .content_type("application/vnd.apple.mpegurl")
                 .body(playlist)
@@ -250,7 +272,7 @@ async fn playlist(args: Data<Args>, req: HttpRequest) -> impl Responder {
 
 #[get("/rtsp/{tail:.*}")]
 async fn rtsp(
-    args: Data<Args>,
+    state: Data<AppState>,
     mut path: Path<String>,
     mut params: Query<BTreeMap<String, String>>,
 ) -> impl Responder {
@@ -259,20 +281,26 @@ async fn rtsp(
     let mut params = params.iter().map(|(k, v)| format!("{}={}", k, v));
     let param = params.next().unwrap_or("".to_string());
     let param = params.fold(param, |o, q| format!("{}&{}", o, q));
-    HttpResponse::Ok().streaming(proxy::rtsp(
-        format!("rtsp://{}?{}", path, param),
-        args.interface.clone(),
-    ))
+    HttpResponse::Ok()
+        .content_type("application/octet-stream")
+        .append_header(("Cache-Control", "no-store"))
+        .streaming(proxy::rtsp(
+            format!("rtsp://{}?{}", path, param),
+            state.args.interface.clone(),
+        ))
 }
 
 #[get("/udp/{addr}")]
-async fn udp(args: Data<Args>, addr: Path<String>) -> impl Responder {
+async fn udp(state: Data<AppState>, addr: Path<String>) -> impl Responder {
     let addr = &*addr;
     let addr = match SocketAddrV4::from_str(addr) {
         Ok(addr) => addr,
         Err(e) => return HttpResponse::BadRequest().body(format!("Error: {}", e)),
     };
-    HttpResponse::Ok().streaming(proxy::udp(addr, args.interface.clone()))
+    HttpResponse::Ok()
+        .content_type("application/octet-stream")
+        .append_header(("Cache-Control", "no-store"))
+        .streaming(proxy::udp(addr, state.args.interface.clone()))
 }
 
 fn usage(cmd: &str) -> std::io::Result<()> {
@@ -315,17 +343,22 @@ async fn main() -> std::io::Result<()> {
         }
     };
 
+    let bind = args.bind.clone();
+    let state = Data::new(
+        AppState::new(args)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?,
+    );
+
     HttpServer::new(move || {
-        let args = Data::new(argh::from_env::<Args>());
         App::new()
             .service(xmltv)
             .service(playlist)
             .service(logo)
             .service(rtsp)
             .service(udp)
-            .app_data(args)
+            .app_data(state.clone())
     })
-    .bind(args.bind)?
+    .bind(bind)?
     .run()
     .await
 }

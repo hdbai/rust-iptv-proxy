@@ -1,43 +1,24 @@
 ################
 # Builder
-FROM rust:1.76-alpine AS builder
+FROM maven:3.9.8-eclipse-temurin-21 AS builder
 
-ARG TARGET=x86_64-unknown-linux-musl
-
-# Install build dependencies
-RUN apk add --no-cache musl-dev
-
-# Set working directory
 WORKDIR /app
 
-# Copy dependency manifests
-COPY Cargo.lock Cargo.toml ./
+COPY pom.xml ./
+RUN mvn -B -q -DskipTests dependency:go-offline
 
-# Create a dummy main.rs to cache dependencies
-RUN mkdir -p src \
-    && echo "fn main() {}" > src/main.rs \
-    && cargo build --release --locked --target ${TARGET} \
-    && rm -rf src target/${TARGET}/release/deps/iptv*
-
-# Copy actual sources
 COPY src ./src
-
-# Build application
-RUN cargo build --release --locked --target ${TARGET}
+RUN mvn -B -DskipTests package
 
 ################
 # Runtime
-FROM alpine:3.19 AS runtime
+FROM eclipse-temurin:21-jre
 
-ARG TARGET=x86_64-unknown-linux-musl
+WORKDIR /app
 
-# Install runtime dependencies and create a non-root user
-RUN apk add --no-cache ca-certificates tzdata \
-    && addgroup -g 1000 appuser \
-    && adduser -u 1000 -G appuser -s /bin/sh -D appuser
+RUN addgroup --system appuser && adduser --system --ingroup appuser appuser
 
-# Copy binary and entrypoint
-COPY --from=builder /app/target/${TARGET}/release/iptv /usr/local/bin/iptv
+COPY --from=builder /app/target/iptv-proxy-0.1.0.jar /usr/local/bin/iptv-proxy.jar
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 

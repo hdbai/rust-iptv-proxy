@@ -29,7 +29,7 @@ public class XmltvFormatter {
             StringWriter buffer = new StringWriter();
             XMLOutputFactory outputFactory = XMLOutputFactory.newInstance();
             XMLEventWriter writer = outputFactory.createXMLEventWriter(buffer);
-            var eventFactory = javax.xml.stream.events.XMLEventFactory.newFactory();
+            var eventFactory = javax.xml.stream.XMLEventFactory.newFactory();
             writer.add(eventFactory.createStartDocument("UTF-8", "1.0"));
             writer.add(eventFactory.createStartElement("", "", "tv"));
             writer.add(eventFactory.createAttribute("generator-info-name", "iptv-proxy"));

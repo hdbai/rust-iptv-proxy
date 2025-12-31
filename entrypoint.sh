@@ -2,7 +2,7 @@
 set -eu
 
 orig_args="$*"
-set -- /usr/local/bin/iptv
+set -- java -jar /usr/local/bin/iptv-proxy.jar
 
 if [ -n "${IPTV_USER:-}" ]; then
     set -- "$@" "-u" "$IPTV_USER"
